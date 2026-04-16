@@ -23,6 +23,20 @@ import { IExperimentationService } from '../../telemetry/common/nullExperimentat
 import { ITelemetryService } from '../../telemetry/common/telemetry';
 import { TelemetryData } from '../../telemetry/common/telemetryData';
 
+/**
+ * Build the `input_schema` for an Anthropic tool from an arbitrary JSON Schema
+ * object. Ensures `type: 'object'` and `properties` default, preserves extra
+ * keys like `$defs` and `additionalProperties`, and strips `$schema` which the
+ * Anthropic API rejects.
+ */
+export function buildToolInputSchema(schema: Record<string, unknown> | undefined): Record<string, unknown> & { type: 'object' } {
+	if (!schema) {
+		return { type: 'object', properties: {} };
+	}
+	const { $schema: _, ...rest } = schema;
+	return { type: 'object', properties: {}, ...rest };
+}
+
 /** IP Code Citation annotation from Messages API copilot_annotations */
 interface AnthropicIPCodeCitation {
 	id: number;
@@ -108,11 +122,7 @@ export function createMessagesRequestBody(accessor: ServicesAccessor, options: I
 			const anthropicTool: AnthropicMessagesTool = {
 				name: tool.function.name,
 				description: tool.function.description || '',
-				input_schema: {
-					type: 'object',
-					properties: (tool.function.parameters as { properties?: Record<string, unknown> })?.properties ?? {},
-					required: (tool.function.parameters as { required?: string[] })?.required ?? [],
-				},
+				input_schema: buildToolInputSchema(tool.function.parameters as Record<string, unknown> | undefined),
 				...(isDeferred ? { defer_loading: true } : {}),
 			};
 			(isDeferred ? deferredTools : nonDeferredTools).push(anthropicTool);
@@ -139,8 +149,7 @@ export function createMessagesRequestBody(accessor: ServicesAccessor, options: I
 	if (options.enableThinking) {
 		const configuredBudget = configurationService.getConfig(ConfigKey.AnthropicThinkingBudget);
 		const thinkingExplicitlyDisabled = configuredBudget === 0;
-		const forceExtendedThinking = configurationService.getExperimentBasedConfig(ConfigKey.AnthropicForceExtendedThinking, experimentationService);
-		if (endpoint.supportsAdaptiveThinking && !thinkingExplicitlyDisabled && !forceExtendedThinking) {
+		if (endpoint.supportsAdaptiveThinking && !thinkingExplicitlyDisabled) {
 			thinkingConfig = { type: 'adaptive' };
 		} else if (!thinkingExplicitlyDisabled && endpoint.maxThinkingBudget && endpoint.minThinkingBudget) {
 			const maxTokens = options.postOptions.max_tokens ?? 1024;
@@ -159,11 +168,9 @@ export function createMessagesRequestBody(accessor: ServicesAccessor, options: I
 	}
 
 	const thinkingEnabled = !!thinkingConfig;
-
-	// Build output config with effort level for thinking, validating reasoningEffort
 	let effort: 'low' | 'medium' | 'high' | undefined;
-	if (thinkingConfig) {
-		const candidateEffort = reasoningEffort;
+	if (thinkingConfig && endpoint.supportsReasoningEffort?.length) {
+		const candidateEffort = configurationService.getConfig(ConfigKey.TeamInternal.AnthropicThinkingEffort) ?? reasoningEffort;
 		if (candidateEffort === 'low' || candidateEffort === 'medium' || candidateEffort === 'high') {
 			effort = candidateEffort;
 		}
@@ -371,6 +378,8 @@ function tryParseToolReferences(content: ContentBlockParam[], validToolNames?: S
 
 function rawContentToAnthropicContent(content: readonly Raw.ChatCompletionContentPart[]): ContentBlockParam[] {
 	const convertedContent: ContentBlockParam[] = [];
+	// Track pending cache_control that couldn't be attached to a preceding block
+	let pendingCacheControl = false;
 
 	for (const part of content) {
 		switch (part.type) {
@@ -409,12 +418,12 @@ function rawContentToAnthropicContent(content: readonly Raw.ChatCompletionConten
 				if (previousBlock && contentBlockSupportsCacheControl(previousBlock)) {
 					previousBlock.cache_control = { type: 'ephemeral' };
 				} else {
-					// Empty string is invalid
-					convertedContent.push({
-						type: 'text',
-						text: ' ',
-						cache_control: { type: 'ephemeral' }
-					});
+					// No preceding block to attach to — defer until the next
+					// cacheable content block is added, or silently drop it.
+					// Previously this created a whitespace-only text block which
+					// the Anthropic API rejects with "text content block must
+					// contain non-whitespace text".
+					pendingCacheControl = true;
 				}
 				break;
 			}
@@ -455,6 +464,15 @@ function rawContentToAnthropicContent(content: readonly Raw.ChatCompletionConten
 					}
 				}
 				break;
+			}
+		}
+
+		// Attach any pending cache_control to the block we just added
+		if (pendingCacheControl && convertedContent.length > 0) {
+			const lastBlock = convertedContent.at(-1)!;
+			if (contentBlockSupportsCacheControl(lastBlock)) {
+				lastBlock.cache_control = { type: 'ephemeral' };
+				pendingCacheControl = false;
 			}
 		}
 	}

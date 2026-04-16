@@ -9,6 +9,7 @@ import { CancellationToken, LanguageModelChatInformation, LanguageModelChatMessa
 import { ChatFetchResponseType, ChatLocation } from '../../../platform/chat/common/commonTypes';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { CustomDataPartMimeTypes } from '../../../platform/endpoint/common/endpointTypes';
+import { buildToolInputSchema } from '../../../platform/endpoint/node/messagesApi';
 import { ILogService } from '../../../platform/log/common/logService';
 import { ContextManagementResponse, getContextManagementFromConfig, isAnthropicContextEditingEnabled, isAnthropicMemoryToolEnabled, isAnthropicToolSearchEnabled, TOOL_SEARCH_TOOL_NAME, TOOL_SEARCH_TOOL_TYPE, ToolSearchToolResult, ToolSearchToolSearchResult } from '../../../platform/networking/common/anthropic';
 import { IToolDeferralService } from '../../../platform/networking/common/toolDeferralService';
@@ -23,8 +24,9 @@ import { toErrorMessage } from '../../../util/common/errorMessage';
 import { RecordedProgress } from '../../../util/common/progressRecorder';
 import { generateUuid } from '../../../util/vs/base/common/uuid';
 import { anthropicMessagesToRawMessagesForLogging, apiMessageToAnthropicMessage } from '../common/anthropicMessageConverter';
-import { BYOKKnownModels, byokKnownModelsToAPIInfo, BYOKModelCapabilities, LMResponsePart } from '../common/byokProvider';
+import { BYOKKnownModels, BYOKModelCapabilities, LMResponsePart } from '../common/byokProvider';
 import { AbstractLanguageModelChatProvider, ExtendedLanguageModelChatInformation, LanguageModelChatConfiguration } from './abstractLanguageModelChatProvider';
+import { byokKnownModelsToAPIInfoWithEffort } from './byokModelInfo';
 import { IBYOKStorageService } from './byokStorageService';
 
 export class AnthropicLMProvider extends AbstractLanguageModelChatProvider {
@@ -85,7 +87,7 @@ export class AnthropicLMProvider extends AbstractLanguageModelChatProvider {
 					};
 				}
 			}
-			return byokKnownModelsToAPIInfo(this._name, modelList);
+			return byokKnownModelsToAPIInfoWithEffort(this._name, modelList);
 		} catch (error) {
 			this._logService.error(error, `Error fetching available ${AnthropicLMProvider.providerName} models`);
 			throw new Error(error.message ? error.message : error);
@@ -189,12 +191,7 @@ export class AnthropicLMProvider extends AbstractLanguageModelChatProvider {
 				tools.push({
 					name: tool.name,
 					description: tool.description,
-					input_schema: {
-						type: 'object',
-						properties: (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {},
-						required: (tool.inputSchema as { required?: string[] }).required ?? [],
-						$schema: (tool.inputSchema as { $schema?: unknown }).$schema
-					},
+					input_schema: buildToolInputSchema(tool.inputSchema as Record<string, unknown>),
 					...(shouldDefer ? { defer_loading: shouldDefer } : {})
 				});
 			}
@@ -240,8 +237,7 @@ export class AnthropicLMProvider extends AbstractLanguageModelChatProvider {
 
 			// Check if model supports adaptive thinking
 			const modelCapabilities = this._knownModels?.[model.id];
-			const forceNonAdaptive = this._configurationService.getExperimentBasedConfig(ConfigKey.AnthropicForceExtendedThinking, this._experimentationService);
-			const supportsAdaptiveThinking = (modelCapabilities?.adaptiveThinking ?? false) && !forceNonAdaptive;
+			const supportsAdaptiveThinking = modelCapabilities?.adaptiveThinking ?? false;
 
 			// Build context management configuration
 			const thinkingEnabled = supportsAdaptiveThinking || (thinkingBudget ?? 0) > 0;
@@ -255,8 +251,6 @@ export class AnthropicLMProvider extends AbstractLanguageModelChatProvider {
 			const betas: string[] = [];
 			if (thinkingBudget && !supportsAdaptiveThinking) {
 				betas.push('interleaved-thinking-2025-05-14');
-			} else if (forceNonAdaptive && (modelCapabilities?.adaptiveThinking ?? false)) {
-				betas.push('interleaved-thinking-2025-05-14');
 			}
 			if (hasMemoryTool || contextManagement) {
 				betas.push('context-management-2025-06-27');
@@ -266,8 +260,9 @@ export class AnthropicLMProvider extends AbstractLanguageModelChatProvider {
 			}
 
 			const rawEffort = options.modelConfiguration?.reasoningEffort;
-			const effort = supportsAdaptiveThinking && typeof rawEffort === 'string'
-				? rawEffort as 'low' | 'medium' | 'high'
+			const supportsEffort = modelCapabilities?.supportsReasoningEffort;
+			const effort = supportsEffort && typeof rawEffort === 'string' && supportsEffort.includes(rawEffort)
+				? rawEffort as 'low' | 'medium' | 'high' | 'max'
 				: undefined;
 
 			const params: Anthropic.Beta.Messages.MessageCreateParamsStreaming = {
